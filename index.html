@@ -1,0 +1,1798 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Distance Energy Swarm (p5.js) • Charge chaos then blast</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #0b0c10; overflow: hidden; }
+      #ui {
+        position: fixed;
+        left: 12px;
+        top: 12px;
+        color: rgba(255,255,255,0.92);
+        font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        user-select: none;
+        max-width: 720px;
+      }
+      #ui .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      #ui button {
+        background: rgba(255,255,255,0.12);
+        border: 1px solid rgba(255,255,255,0.25);
+        color: white;
+        padding: 8px 10px;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      #ui button:hover { background: rgba(255,255,255,0.18); }
+      #ui button.active {
+        background: rgba(255,255,255,0.26);
+        border-color: rgba(255,255,255,0.42);
+      }
+      #ui .small { color: rgba(255,255,255,0.72); font-size: 12px; }
+      #ui code { color: rgba(255,255,255,0.9); }
+      #ui .pill {
+        padding: 3px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.22);
+        background: rgba(255,255,255,0.08);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      <div class="row">
+        <button id="connectBtn" title="Chrome or Edge desktop recommended">Connect Serial</button>
+        <button id="simulateBtn" title="Use mouse X as distance">Simulate (mouse)</button>
+        <span id="modePill" class="pill">Mode: simulate</span>
+      </div>
+
+      <div class="row" style="margin-top:10px">
+        <button id="coolBtn" class="active">Cool Cyber</button>
+        <button id="warmBtn">Warm Ember</button>
+        <span id="palPill" class="pill">Palette: cool</span>
+      </div>
+
+      <div class="small" style="margin-top:10px">
+        Serial input accepted: numeric lines like <code>37.2</code> or text lines like <code>Distance: 37.2 cm</code>
+      </div>
+
+      <div class="small" style="margin-top:6px">
+        Current: <span id="readout">0</span>
+        <span style="margin-left:10px">speed: <span id="speedout">0</span> cm/s</span>
+        <span style="margin-left:10px">energy: <span id="energyout">0</span></span>
+        <span style="margin-left:10px">state: <span id="stateout">idle</span></span>
+      </div>
+
+      <div class="small" style="margin-top:6px">
+        Last line: <span id="lastLine">(none)</span>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+    <script>
+      // ------------------------------------------------------------
+      // Behavior summary
+      // Far (your hand back):
+      //   Particles converge toward center.
+      //   Chaos rises as energy builds.
+      //   Energy increases over time, plus a bit with hand motion while far.
+      // Push forward (near threshold):
+      //   Energy is spent as a blast impulse that throws particles outward.
+      // ------------------------------------------------------------
+
+      // ---------------- Input ----------------
+      let mode = "simulate"; // "simulate" | "serial"
+      let distanceCm = 30;   // raw serial or simulated value
+      let distSmooth = 30;   // smoothed visual value
+
+      // Your effective physical range is about 0..50 cm.
+      // We scale serial by 2 so that 50 cm maps to visual 100.
+      const SERIAL_SCALE = 2.0;
+
+      let distMin = 0;
+      let distMax = 100;
+
+      let port, reader;
+      let serialBuffer = "";
+
+      function setMode(m) {
+        mode = m;
+        document.getElementById("modePill").textContent = `Mode: ${m}`;
+        updateCursor();
+      }
+
+      function updateCursor() {
+        if (mode === "serial") cursor("none");
+        else cursor("default");
+      }
+
+      function extractDistanceCm(line) {
+        const m = String(line).match(/(-?\d+(\.\d+)?)/);
+        if (!m) return null;
+        const v = parseFloat(m[1]);
+        return Number.isFinite(v) ? v : null;
+      }
+
+      async function connectSerial() {
+        if (!("serial" in navigator)) {
+          alert("Web Serial not supported here. Try Chrome or Edge on desktop.");
+          return;
+        }
+        try {
+          port = await navigator.serial.requestPort();
+          await port.open({ baudRate: 9600 }); // matches Serial.begin(9600)
+
+          const decoder = new TextDecoderStream();
+          port.readable.pipeTo(decoder.writable);
+          reader = decoder.readable.getReader();
+
+          setMode("serial");
+          readSerialLoop();
+        } catch (err) {
+          console.error(err);
+          alert("Could not open serial port. Check permissions and that nothing else is using it.");
+        }
+      }
+
+      async function readSerialLoop() {
+        while (mode === "serial" && reader) {
+          try {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+
+            serialBuffer += value;
+            let lines = serialBuffer.split("\n");
+            serialBuffer = lines.pop();
+
+            for (const rawLine of lines) {
+              const line = rawLine.trim();
+              if (!line) continue;
+
+              document.getElementById("lastLine").textContent = line;
+
+              const v = extractDistanceCm(line);
+              if (v !== null) distanceCm = v;
+            }
+          } catch (err) {
+            console.error(err);
+            break;
+          }
+        }
+      }
+
+      document.getElementById("connectBtn").addEventListener("click", connectSerial);
+      document.getElementById("simulateBtn").addEventListener("click", () => setMode("simulate"));
+
+      // ---------------- Palette toggle ----------------
+      let palette = "cool"; // "cool" | "warm"
+      const coolBtn = document.getElementById("coolBtn");
+      const warmBtn = document.getElementById("warmBtn");
+
+      function setPalette(p) {
+        palette = p;
+        document.getElementById("palPill").textContent = `Palette: ${p}`;
+        coolBtn.classList.toggle("active", p === "cool");
+        warmBtn.classList.toggle("active", p === "warm");
+      }
+
+      coolBtn.addEventListener("click", () => setPalette("cool"));
+      warmBtn.addEventListener("click", () => setPalette("warm"));
+
+      // ---------------- Energy + velocity ----------------
+      let prevDistSmooth = 30;
+      let vCmPerSec = 0;
+
+      let energy = 100;       // 0..1, accumulates while far
+      let blast = 0;        // 0..1, active right after trigger then decays
+      let wasFar = false;
+
+      // These thresholds are in VISUAL units (0..100).
+      // With SERIAL_SCALE=2, physical 35 cm corresponds to visual 70.
+      const FAR_THRESHOLD = 40;    // far enough to start charging
+      const NEAR_THRESHOLD = 10;   // push forward past this to trigger blast
+
+      // How energy grows and decays
+      const ENERGY_CHARGE_RATE = 0.36;   // per second, while far
+      const ENERGY_MOTION_GAIN = 0.0022; // per (cm/s)*second while far
+      const ENERGY_LEAK_RATE = 0.08;     // per second, when not far
+
+      // Blast behavior
+      const BLAST_DECAY = 3.2;           // per second
+      const BLAST_STRENGTH = 2.4;        // impulse multiplier
+
+      // ---------------- Visualization ----------------
+      let particles = [];
+      const N = 2000;
+
+      function setup() {
+        createCanvas(window.innerWidth, window.innerHeight);
+        pixelDensity(1);
+        colorMode(HSB, 360, 100, 100, 100);
+
+        for (let i = 0; i < N; i++) particles.push(new Particle());
+        noStroke();
+        updateCursor();
+      }
+
+      function windowResized() {
+        resizeCanvas(window.innerWidth, window.innerHeight);
+      }
+
+      function draw() {
+        const dt = deltaTime / 1000;
+
+        // 1) Input
+        if (mode === "simulate") {
+          const t = constrain(mouseX / max(1, width), 0, 1);
+          distanceCm = lerp(distMin, distMax, t);
+        }
+
+        let d = distanceCm;
+        if (mode === "serial") d *= SERIAL_SCALE;
+
+        d = constrain(d, distMin, distMax);
+
+        // Snappy smoothing so it reacts well with your delay(30)
+        distSmooth = lerp(distSmooth, d, 0.75);
+
+        // 2) Velocity
+        vCmPerSec = (distSmooth - prevDistSmooth) / max(1e-6, dt);
+        prevDistSmooth = distSmooth;
+        const speed = abs(vCmPerSec);
+
+        // 3) Energy state machine
+        const isFar = distSmooth >= FAR_THRESHOLD;
+        const isNear = distSmooth <= NEAR_THRESHOLD;
+
+        // Energy rises when far, and rises faster with motion while far
+        if (isFar) {
+          energy = constrain(
+            energy + ENERGY_CHARGE_RATE * dt + (speed * ENERGY_MOTION_GAIN) * dt,
+            0, 1
+          );
+        } else {
+          // Small leak when you are not far, so energy does not stick forever
+          energy = max(0, energy - ENERGY_LEAK_RATE * dt);
+        }
+
+        // Trigger: you were far and now you push near
+        if (wasFar && isNear) {
+          blast = energy;
+          energy = 0;
+        }
+        wasFar = isFar;
+
+        // Blast decay
+        blast = max(0, blast - BLAST_DECAY * dt);
+
+        // 4) Map distance to base behavior
+        const closeness = 1 - (distSmooth - distMin) / max(1e-6, (distMax - distMin)); // 0..1
+        const chaos = constrain(energy * 0.85 + blast * 0.35, 0, 1);
+
+        // Converge stronger when far, but chaotic when energy is high
+        // pullIn is strongest when far (closeness low), and chaos adds shake
+        let pullIn = lerp(0.34, 0.07, pow(closeness, 1.2)); // far -> larger pull inward
+        let swirl = lerp(0.25, 0.85, pow(1 - closeness, 1.0)); // far -> more swirl
+        let jitter = 0.08 + chaos * 0.55;
+
+        // As energy builds, crank swirl and jitter, and slightly increase pull
+        pullIn *= (1 + 0.35 * energy);
+        swirl *= (1 + 1.05 * energy);
+        jitter *= (1 + 1.15 * energy);
+
+        // Velocity awareness: fast hand motion adds turbulence briefly
+        const speedBoost = 1 + constrain(speed / 120, 0, 1) * 0.35;
+        swirl *= speedBoost;
+        jitter *= speedBoost;
+
+        // Trails, fade changes with chaos
+        const fade = lerp(18, 40, 1 - chaos);
+        fill(220, 30, 6, fade);
+        rect(0, 0, width, height);
+
+        // Center
+        const cx = width * 0.5;
+        const cy = height * 0.5;
+        const time = millis() * 0.001;
+
+        // Small center wobble increases with chaos
+        const wob = 16 + 34 * chaos;
+        const bx = cx + sin(time * 0.9) * wob * 0.35;
+        const by = cy + cos(time * 0.8) * wob * 0.35;
+
+        // Update particles
+        for (let p of particles) {
+          p.step(bx, by, pullIn, swirl, jitter, time, blast, chaos);
+          p.render(closeness, energy, blast, speed, chaos, palette);
+        }
+
+        // UI
+        document.getElementById("readout").textContent = distSmooth.toFixed(1);
+        document.getElementById("speedout").textContent = speed.toFixed(1);
+        document.getElementById("energyout").textContent = energy.toFixed(2);
+
+        let state = "idle";
+        if (blast > 0.02) state = "blast";
+        else if (isFar) state = "charging";
+        else state = "drift";
+        document.getElementById("stateout").textContent = state;
+
+        // Optional helper ring in simulate mode only
+        if (mode === "simulate") {
+          const r = lerp(18, 90, chaos);
+          fill(0, 0, 100, 6);
+          circle(bx, by, r * 2);
+        }
+      }
+
+      class Particle {
+        constructor() { this.reset(true); }
+
+        reset(initial = false) {
+          const angle = random(TWO_PI);
+          const r = random(60, min(width, height) * 0.55);
+          this.x = width * 0.5 + cos(angle) * r;
+          this.y = height * 0.5 + sin(angle) * r;
+          this.vx = random(-0.7, 0.7);
+          this.vy = random(-0.7, 0.7);
+          this.life = initial ? random(40, 220) : random(70, 260);
+        }
+
+        step(cx, cy, pullIn, swirl, jitter, time, blast, chaos) {
+          let dx = cx - this.x;
+          let dy = cy - this.y;
+
+          const d = sqrt(dx * dx + dy * dy) + 0.0001;
+          const nx = dx / d;
+          const ny = dy / d;
+
+          // Converge inward
+          this.vx += nx * pullIn;
+          this.vy += ny * pullIn;
+
+          // Swirl around center
+          this.vx += -ny * swirl * pullIn;
+          this.vy +=  nx * swirl * pullIn;
+
+          // Flow field, stronger with chaos
+          const fx = sin((this.y * 0.006) + time * 1.1) + cos((this.x * 0.004) - time * 0.9);
+          const fy = cos((this.x * 0.006) + time * 1.0) - sin((this.y * 0.004) - time * 1.2);
+          const field = 0.018 * (0.35 + chaos);
+          this.vx += fx * field;
+          this.vy += fy * field;
+
+          // Jitter, stronger when energy is high
+          this.vx += random(-jitter, jitter) * 0.06;
+          this.vy += random(-jitter, jitter) * 0.06;
+
+          // Blast: outward impulse, strongest near center
+          if (blast > 0) {
+            const out = BLAST_STRENGTH * blast;
+            const falloff = 1 / (1 + d * 0.018);
+            this.vx += (-nx) * out * falloff;
+            this.vy += (-ny) * out * falloff;
+
+            // Extra tangential kick gives a fiery burst feel
+            const tang = 0.65 * blast;
+            this.vx += (-ny) * tang * falloff;
+            this.vy += ( nx) * tang * falloff;
+          }
+
+          // Damping, slightly less damping when chaotic so it feels energetic
+          const damp = lerp(0.987, 0.981, chaos);
+          this.vx *= damp;
+          this.vy *= damp;
+
+          this.x += this.vx;
+          this.y += this.vy;
+
+          // Respawn conditions
+          this.life -= 1;
+          const outBounds = this.x < -60 || this.x > width + 60 || this.y < -60 || this.y > height + 60;
+
+          // If too close to the center, recycle sometimes so the core does not become a dot
+          const tooClose = d < 6 && random() < 0.22;
+
+          if (this.life <= 0 || outBounds || tooClose) this.reset();
+        }
+
+        render(closeness, energy, blast, speed, chaos, palette) {
+          const speedN = constrain(speed / 90, 0, 1);
+
+          // Palette hue endpoints
+          let hA, hB, accent;
+          if (palette === "cool") {
+            hA = 195;  // cyan blue
+            hB = 295;  // purple
+            accent = 320;
+          } else {
+            hA = 40;   // amber
+            hB = 5;    // red
+            accent = 55; // yellow spark
+          }
+
+          // Hue shifts from A to B with energy, then nudges to accent with speed
+          let hue = lerp(hA, hB, energy);
+          hue = lerp(hue, accent, speedN * 0.28);
+
+          // Saturation and brightness
+          const satBase = palette === "cool" ? 92 : 96;
+          const satMin = palette === "cool" ? 16 : 10;
+
+          // Blast flashes by reducing saturation briefly
+          const sat = lerp(satMin, satBase, 1 - min(1, blast * 1.35));
+
+          // Brightness rises with chaos, and peaks on blast
+          let bri = 72 + 22 * chaos + 16 * blast;
+          bri = constrain(bri, 0, 100);
+
+          // Alpha and size
+          let a = lerp(14, 48, 1 - closeness) + 26 * chaos + 22 * blast;
+          a = constrain(a, 0, 100);
+
+          // Bigger particles when chaotic, slightly bigger near center on blast
+          let s = lerp(1.2, 2.2, 1 - closeness);
+          s *= (1 + 0.85 * chaos);
+          s *= (1 + 0.55 * blast);
+
+          fill(hue, sat, bri, a);
+          circle(this.x, this.y, s);
+        }
+      }
+    </script>
+  </body>
+</html>
+
+ -->
+
+
+
+<!-- <!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lightning (Lite)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .hud{
+      position: fixed; left: 12px; top: 10px; color: rgba(220,235,255,0.75);
+      font: 13px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      user-select: none; pointer-events: none;
+      text-shadow: 0 1px 10px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">Click or move mouse. Space for a strike.</div>
+
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  // Cap DPR to reduce pixel workload a lot
+  DPR = Math.min(1.25, window.devicePixelRatio || 1);
+  W = Math.floor(window.innerWidth);
+  H = Math.floor(window.innerHeight);
+  canvas.width = Math.floor(W * DPR);
+  canvas.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+const rand = (a,b)=>a+Math.random()*(b-a);
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+const pointer = { x: W*0.5, y: H*0.65, active: false };
+function setPointer(x,y){ pointer.x=x; pointer.y=y; pointer.active=true; }
+
+addEventListener("pointermove", e => setPointer(e.clientX, e.clientY));
+addEventListener("pointerdown", e => { setPointer(e.clientX,e.clientY); spawnStrike(1.0); });
+addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); spawnStrike(1.2); } });
+
+function generateBolt(x0,y0,x1,y1,{steps=50,sway=35,jag=0.6,forkChance=0.06}={}) {
+  const pts=[{x:x0,y:y0}];
+  const dx=x1-x0, dy=y1-y0;
+  const len=Math.hypot(dx,dy)||1;
+  const px=-dy/len, py=dx/len;
+
+  for (let i=1;i<=steps;i++){
+    const t=i/steps;
+    const bx=x0+dx*t, by=y0+dy*t;
+    const amp=Math.sin(Math.PI*t)*sway;
+    const off=(Math.random()*2-1)*amp*jag;
+    pts.push({ x: bx + px*off, y: by + py*off });
+  }
+
+  const forks=[];
+  for (let i=12;i<pts.length-12;i++){
+    if (Math.random()<forkChance){
+      const p=pts[i];
+      const angle=rand(-1.0,1.0);
+      const cs=Math.cos(angle), sn=Math.sin(angle);
+      const nx=dx/len, ny=dy/len;
+      const rx=nx*cs-ny*sn, ry=nx*sn+ny*cs;
+      const fl=rand(80,170);
+      forks.push(generateBolt(p.x,p.y,p.x+rx*fl,p.y+ry*fl,{steps:22,sway:20,jag:0.7,forkChance:0.03}));
+    }
+  }
+  return { pts, forks };
+}
+
+function strokeBolt(bolt,width,alpha,glow){
+  const pts=bolt.pts;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+
+  ctx.globalAlpha = alpha;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  if (glow){
+    ctx.shadowBlur = 14;
+    ctx.shadowColor = "rgba(150,210,255,0.8)";
+  } else {
+    ctx.shadowBlur = 0;
+  }
+  ctx.stroke();
+
+  if (bolt.forks) for (const f of bolt.forks) strokeBolt(f, Math.max(1,width*0.6), alpha*0.8, glow);
+}
+
+const bolts = [];
+let flash = 0;
+
+// Hard limits to keep it safe
+const MAX_BOLTS = 3;
+
+function spawnStrike(strength=1){
+  if (bolts.length >= MAX_BOLTS) bolts.shift();
+
+  const fromX = rand(W*0.25, W*0.75);
+  const fromY = rand(-30, 30);
+  const toX = pointer.active ? pointer.x : rand(W*0.2, W*0.8);
+  const toY = pointer.active ? pointer.y : rand(H*0.35, H*0.85);
+
+  const bolt = generateBolt(fromX, fromY, toX, toY, {
+    steps: Math.floor(45 + 12*strength),
+    sway: 28 + 22*strength,
+    jag: 0.55 + 0.15*strength,
+    forkChance: 0.05 + 0.03*strength
+  });
+
+  bolts.push({ bolt, life: 0, ttl: 180 + strength*60, strength });
+  flash = clamp(flash + 0.25 + 0.25*strength, 0, 1);
+}
+
+let nextStrike = 0;
+function scheduleNextStrike(){ nextStrike = performance.now() + rand(800, 2600); }
+scheduleNextStrike();
+
+// Cap rendering to ~30 fps
+const FRAME_MS = 1000/30;
+let last = performance.now();
+let acc = 0;
+
+function draw(dt){
+  // simpler background, minimal blending
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "rgba(0,0,0,0.30)";
+  ctx.fillRect(0,0,W,H);
+
+  // strikes
+  ctx.globalCompositeOperation = "lighter";
+  ctx.strokeStyle = "rgba(240,250,255,1)";
+
+  for (let i=bolts.length-1;i>=0;i--){
+    const b=bolts[i];
+    b.life += dt;
+    const t=b.life/b.ttl;
+    const fade=1-t;
+    const flick=0.75 + 0.25*Math.sin(b.life/24 + i*1.7);
+    const a=clamp(fade*flick,0,1);
+
+    // Only one glow pass, one core pass
+    strokeBolt(b.bolt, 4 + b.strength*2, a*0.18, true);
+    ctx.strokeStyle = "rgba(255,255,255,1)";
+    strokeBolt(b.bolt, 1.4 + b.strength*0.6, a*0.95, false);
+
+    if (b.life >= b.ttl) bolts.splice(i,1);
+  }
+
+  // flash
+  if (flash > 0.001){
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = flash * 0.55;
+    ctx.fillStyle = "rgba(170,220,255,1)";
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+    flash *= 0.86;
+  } else flash = 0;
+}
+
+function frame(now){
+  const dt = clamp(now - last, 0, 50);
+  last = now;
+  acc += dt;
+
+  if (now >= nextStrike){
+    spawnStrike(rand(0.7, 1.0));
+    scheduleNextStrike();
+  }
+
+  while (acc >= FRAME_MS){
+    draw(FRAME_MS);
+    acc -= FRAME_MS;
+  }
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+
+
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Omnibending: The Grand Metamorphosis</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+        #ui { position: absolute; top: 20px; left: 20px; color: white; pointer-events: none; z-index: 100; }
+        .stats { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 2px; }
+        #distLabel { font-size: 24px; font-weight: bold; color: #00ffcc; }
+        #debug { position: absolute; bottom: 20px; left: 20px; color: #444; font-size: 10px; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div class="stats">System Distance</div>
+        <div id="distLabel">0cm</div>
+    </div>
+    <div id="debug">Move mouse Y to simulate HC-SR04 sensor</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script id="fireVertex" type="x-shader/x-vertex">
+        uniform float uTime;
+        uniform float uIntensity;
+        varying float vOpacity;
+        void main() {
+            vec3 p = position;
+            float h = (p.y + 1.0) * 0.5;
+            p.y += uTime * 0.5 * (1.0 + h);
+            p.x += sin(uTime * 2.0 + p.y * 5.0) * 0.1 * h;
+            p.z += cos(uTime * 1.5 + p.y * 5.0) * 0.1 * h;
+            if(p.y > 2.0) p.y = -1.0;
+            vOpacity = (1.0 - (p.y / 2.0)) * uIntensity;
+            vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = (10.0 / -mvPosition.z) * (1.0 + h);
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    </script>
+
+    <script id="fireFragment" type="x-shader/x-fragment">
+        varying float vOpacity;
+        void main() {
+            float d = length(gl_PointCoord - vec2(0.5));
+            if(d > 0.5) discard;
+            vec3 color = mix(vec3(1.0, 0.2, 0.0), vec3(1.0, 0.8, 0.3), vOpacity);
+            gl_FragColor = vec4(color, vOpacity * (0.5 - d) * 2.0);
+        }
+    </script>
+
+    <script>
+        // --- CORE ENGINE ---
+        let scene, camera, renderer, clock;
+        let fireSystem, waterSystem, earthSystem, airSystem;
+        let virtualDist = 0; // 0 to 150
+
+        // 1. FIRE SYSTEM
+        class FireSystem {
+            constructor() {
+                const count = 4000;
+                const geo = new THREE.BufferGeometry();
+                const pos = new Float32Array(count * 3);
+                for(let i=0; i<count*3; i+=3) {
+                    pos[i] = (Math.random() - 0.5) * 0.8;
+                    pos[i+1] = Math.random() * 3.0 - 1.0;
+                    pos[i+2] = (Math.random() - 0.5) * 0.8;
+                }
+                geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                this.mat = new THREE.ShaderMaterial({
+                    uniforms: { uTime: { value: 0 }, uIntensity: { value: 0 } },
+                    vertexShader: document.getElementById('fireVertex').textContent,
+                    fragmentShader: document.getElementById('fireFragment').textContent,
+                    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+                });
+                this.points = new THREE.Points(geo, this.mat);
+                scene.add(this.points);
+            }
+            update(time, intensity) {
+                this.mat.uniforms.uTime.value = time;
+                this.mat.uniforms.uIntensity.value = intensity;
+                this.points.visible = intensity > 0.01;
+            }
+        }
+
+        // 2. WATER SYSTEM (Metaball Droplets)
+        class WaterSystem {
+            constructor() {
+                this.group = new THREE.Group();
+                const geo = new THREE.SphereGeometry(1, 32, 32);
+                const mat = new THREE.MeshPhongMaterial({
+                    color: 0x00aaff, transparent: true, opacity: 0.6,
+                    shininess: 100, reflectivity: 1.0
+                });
+                this.balls = [];
+                for(let i=0; i<15; i++) {
+                    const b = new THREE.Mesh(geo, mat);
+                    b.scale.setScalar(Math.random() * 0.3 + 0.2);
+                    this.group.add(b);
+                    this.balls.push({
+                        mesh: b,
+                        offset: Math.random() * 10,
+                        speed: 0.5 + Math.random()
+                    });
+                }
+                scene.add(this.group);
+            }
+            update(time, intensity) {
+                this.group.visible = intensity > 0.01;
+                this.balls.forEach((b, i) => {
+                    const t = time * b.speed + b.offset;
+                    b.mesh.position.set(
+                        Math.sin(t) * 0.8,
+                        Math.cos(t * 0.7) * 0.8,
+                        Math.sin(t * 1.2) * 0.8
+                    );
+                    b.mesh.material.opacity = intensity * 0.6;
+                });
+            }
+        }
+
+        // 3. EARTH SYSTEM (Instanced Rocks with Humanoid Assembly)
+        class EarthSystem {
+            constructor() {
+                const count = 60;
+                const geo = new THREE.DodecahedronGeometry(0.2, 0);
+                const mat = new THREE.MeshStandardMaterial({ color: 0x665544, roughness: 0.9 });
+                this.mesh = new THREE.InstancedMesh(geo, mat, count);
+                this.dummy = new THREE.Object3D();
+                
+                // Define Humanoid Targets (Head, Torso, Arms, Legs)
+                this.targets = [];
+                for(let i=0; i<count; i++) {
+                    let targetPos = new THREE.Vector3();
+                    if(i < 10) { // Head (top sphere)
+                        targetPos.set((Math.random()-0.5)*0.3, 1.2 + Math.random()*0.3, (Math.random()-0.5)*0.3);
+                    } else if(i < 30) { // Torso (middle block)
+                        targetPos.set((Math.random()-0.5)*0.6, 0.4 + (Math.random()-0.5)*0.8, (Math.random()-0.5)*0.4);
+                    } else { // Limbs (dispersed columns)
+                        targetPos.set((Math.random()-0.5)*1.2, (Math.random()-0.5)*1.5, (Math.random()-0.5)*0.5);
+                    }
+
+                    // Manual random direction for r128 compatibility
+                    let randomOrbit = new THREE.Vector3(
+                        Math.random() - 0.5, 
+                        Math.random() - 0.5, 
+                        Math.random() - 0.5
+                    ).normalize().multiplyScalar(2.0);
+
+                    this.targets.push({
+                        assembled: targetPos,
+                        dispersed: randomOrbit,
+                        rot: new THREE.Vector3(Math.random(), Math.random(), Math.random())
+                    });
+                }
+                scene.add(this.mesh);
+            }
+            update(time, intensity) {
+                this.mesh.visible = intensity > 0.01;
+                for(let i=0; i<this.targets.length; i++) {
+                    let t = this.targets[i];
+                    // Assembly logic: move from random orbit to skeleton
+                    let assembleFactor = THREE.MathUtils.smoothstep(virtualDist, 70, 95);
+                    let finalPos = new THREE.Vector3().lerpVectors(t.dispersed, t.assembled, assembleFactor);
+                    
+                    this.dummy.position.copy(finalPos);
+                    this.dummy.rotation.set(t.rot.x + time * 0.2, t.rot.y + time * 0.3, t.rot.z);
+                    this.dummy.scale.setScalar(intensity);
+                    this.dummy.updateMatrix();
+                    this.mesh.setMatrixAt(i, this.dummy.matrix);
+                }
+                this.mesh.instanceMatrix.needsUpdate = true;
+            }
+        }
+
+        // 4. AIR SYSTEM (Soap Bubbles)
+        class AirSystem {
+            constructor() {
+                const count = 100;
+                const geo = new THREE.SphereGeometry(0.2, 24, 24);
+                // Physical material for iridescence
+                const mat = new THREE.MeshPhysicalMaterial({
+                    transparent: true, opacity: 0.4, roughness: 0, 
+                    transmission: 0.5, thickness: 0.1,
+                    iridescence: 1.0, iridescenceIOR: 1.3
+                });
+                this.mesh = new THREE.InstancedMesh(geo, mat, count);
+                this.dummy = new THREE.Object3D();
+                
+                this.particles = [];
+                for(let i=0; i<count; i++) {
+                    this.particles.push({
+                        pos: new THREE.Vector3(
+                            (Math.random()-0.5)*4, 
+                            (Math.random()-0.5)*4, 
+                            (Math.random()-0.5)*4
+                        ),
+                        vel: new THREE.Vector3(
+                            (Math.random()-0.5)*0.01, 
+                            0.005 + Math.random()*0.01, 
+                            (Math.random()-0.5)*0.01
+                        )
+                    });
+                }
+                scene.add(this.mesh);
+            }
+            update(time, intensity) {
+                this.mesh.visible = intensity > 0.01;
+                this.particles.forEach((p, i) => {
+                    p.pos.add(p.vel);
+                    // Wrap around logic
+                    if(p.pos.y > 2.5) p.pos.y = -2.5;
+                    if(Math.abs(p.pos.x) > 3.0) p.pos.x *= -0.9;
+                    
+                    this.dummy.position.copy(p.pos);
+                    // Add a tiny float wobble
+                    this.dummy.position.x += Math.sin(time + i) * 0.01;
+                    
+                    this.dummy.scale.setScalar(intensity * (0.5 + Math.sin(time*0.5 + i)*0.5));
+                    this.dummy.updateMatrix();
+                    this.mesh.setMatrixAt(i, this.dummy.matrix);
+                });
+                this.mesh.instanceMatrix.needsUpdate = true;
+            }
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000);
+            document.body.appendChild(renderer.domElement);
+
+            const light = new THREE.PointLight(0xffffff, 1);
+            light.position.set(5, 5, 5);
+            scene.add(light, new THREE.AmbientLight(0x222222));
+
+            clock = new THREE.Clock();
+            fireSystem = new FireSystem();
+            waterSystem = new WaterSystem();
+            earthSystem = new EarthSystem();
+            airSystem = new AirSystem();
+
+            window.addEventListener('mousemove', (e) => {
+                virtualDist = (1.0 - e.clientY / window.innerHeight) * 150;
+                document.getElementById('distLabel').textContent = Math.round(virtualDist) + "cm";
+            });
+
+            animate();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // METAMORPHOSIS LOGIC: Intensity Mapping
+            const getIntensity = (val, min, max, fade) => {
+                return THREE.MathUtils.smoothstep(val, min - fade, min) * (1.0 - THREE.MathUtils.smoothstep(val, max, max + fade));
+            };
+
+            fireSystem.update(time, getIntensity(virtualDist, 0, 25, 10));
+            waterSystem.update(time, getIntensity(virtualDist, 35, 60, 10));
+            earthSystem.update(time, getIntensity(virtualDist, 75, 95, 10));
+            airSystem.update(time, getIntensity(virtualDist, 110, 150, 10));
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html> -->
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Omnibending</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: 'Arial', sans-serif;
+      background: #0a0a0a;
+    }
+    canvas { display: block; }
+    #ui {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 20px;
+      border-radius: 10px;
+      color: #fff;
+      min-width: 250px;
+      backdrop-filter: blur(10px);
+    }
+    h2 { margin: 0 0 15px 0; font-size: 18px; color: #fff; }
+    .element-btn {
+      padding: 10px 20px;
+      margin: 5px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+      transition: all 0.3s;
+      opacity: 0.6;
+    }
+    .element-btn.active {
+      opacity: 1;
+      transform: scale(1.05);
+      box-shadow: 0 0 20px currentColor;
+    }
+    .fire { background: #ff4500; color: #fff; }
+    .water { background: #1e90ff; color: #fff; }
+    .earth { background: #8b4513; color: #fff; }
+    .air { background: #87ceeb; color: #333; }
+    .control { margin: 15px 0; }
+    label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
+    input[type="range"] { width: 100%; margin: 5px 0; }
+    .value { float: right; color: #fff; }
+
+    /* Added: simulated sensor readout */
+    #simBox {
+      margin-top: 14px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.12);
+      font-size: 12px;
+      color: #ddd;
+      line-height: 1.35;
+    }
+    #simBox strong { color: #fff; }
+    #simRow { display: flex; gap: 10px; flex-wrap: wrap; }
+    .pill {
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: #fff;
+    }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .github-link { position: fixed; bottom: 14px; right: 20px; font-size: 32px; color: rgba(255, 255, 255, 0.5); z-index: 1000; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <h2>Elemental Spheres</h2>
+
+    <div>
+      <button class="element-btn fire active" onclick="setElement('fire')">🔥 Fire</button>
+      <button class="element-btn water" onclick="setElement('water')">💧 Water</button>
+      <button class="element-btn earth" onclick="setElement('earth')">🌍 Earth</button>
+      <button class="element-btn air" onclick="setElement('air')">💨 Air</button>
+    </div>
+
+    <div class="control">
+      <label>Intensity <span class="value" id="intensityVal">1.0</span></label>
+      <input type="range" id="intensity" min="0.1" max="2" step="0.1" value="1.0">
+    </div>
+    <div class="control">
+      <label>Speed <span class="value" id="speedVal">1.0</span></label>
+      <input type="range" id="speed" min="0.1" max="3" step="0.1" value="1.0">
+    </div>
+    <div class="control">
+      <label>Turbulence <span class="value" id="turbulenceVal">1.0</span></label>
+      <input type="range" id="turbulence" min="0.1" max="3" step="0.1" value="1.0">
+    </div>
+
+    <div id="simBox">
+      <div><strong>Simulated sensor</strong> (CSV stream: <span class="mono" id="simLine">0,0</span>)</div>
+      <div id="simRow" style="margin-top:8px;">
+        <div class="pill">d: <span class="mono" id="dVal">0.0</span> cm</div>
+        <div class="pill">v: <span class="mono" id="vVal">0.0</span> cm/s</div>
+        <div class="pill">state: <span class="mono" id="stateVal">fire</span></div>
+      </div>
+      <div style="margin-top:8px;color:#aaa;">
+        Looping through 4 regimes every ~2.5s by changing simulated distance and speed.
+      </div>
+    </div>
+  </div>
+  <a href="https://github.com/shwnmnl/omnibending" target="_blank" class="github-link" aria-label="GitHub">
+  <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2.1c-3.2.7-3.9-1.5-3.9-1.5-.5-1.3-1.3-1.6-1.3-1.6-1-.7.1-.7.1-.7 1.1.1 1.7 1.1 1.7 1.1 1 .1.5 2.2 2.9 2.7.3-.7.7-1.2 1.2-1.5-2.5-.3-5.1-1.3-5.1-5.7 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.3 11.3 0 0 1 6 0C16.8 6 17.8 6.3 17.8 6.3c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.2 0 4.4-2.6 5.4-5.1 5.7.4.3.7 1 .7 2v3c0 .3.2.7.8.6A11.5 11.5 0 0 0 23.5 12C23.5 5.7 18.3.5 12 .5z"/>
+  </svg>
+</a>
+
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    let scene, camera, renderer, sphere, material;
+    let time = 0;
+    let currentElement = 'fire';
+
+    const params = {
+      intensity: 1.0,
+      speed: 1.0,
+      turbulence: 1.0
+    };
+
+    const vertexShader = `
+      varying vec2 vUv;
+      varying vec3 vPosition;
+      varying vec3 vNormal;
+
+      void main() {
+        vUv = uv;
+        vPosition = position;
+        vNormal = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    const fragmentShader = `
+      uniform float time;
+      uniform float intensity;
+      uniform float turbulence;
+      uniform int elementType;
+      varying vec2 vUv;
+      varying vec3 vPosition;
+      varying vec3 vNormal;
+
+      vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+      vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+      float snoise(vec3 v) {
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i  = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy;
+        vec3 x3 = x0 - D.yyy;
+        i = mod289(i);
+        vec4 p = permute(permute(permute(
+          i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+        float n_ = 0.142857142857;
+        vec3 ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x;
+        p1 *= norm.y;
+        p2 *= norm.z;
+        p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+
+      void main() {
+        vec3 pos = vPosition * turbulence;
+        float noise = snoise(pos + time * 0.5);
+
+        vec3 color;
+        float alpha = 1.0;
+        float glow = 0.0;
+
+        if (elementType == 0) {
+          float flameNoise = snoise(vec3(pos.x * 2.0, pos.y * 3.0 + time * 2.0, pos.z * 2.0));
+          flameNoise += snoise(vec3(pos.x * 4.0, pos.y * 6.0 + time * 3.0, pos.z * 4.0)) * 0.5;
+          float flame = smoothstep(0.0, 1.0, (vPosition.y + 1.0) * 0.5 + flameNoise * 0.3);
+
+          vec3 yellow = vec3(1.0, 0.9, 0.0);
+          vec3 orange = vec3(1.0, 0.4, 0.0);
+          vec3 red = vec3(0.8, 0.0, 0.0);
+
+          color = mix(red, orange, flame);
+          color = mix(color, yellow, pow(flame, 2.0));
+          color *= intensity;
+          glow = 0.5 + noise * 0.3;
+        }
+        else if (elementType == 1) {
+          float wave = sin(pos.x * 3.0 + time * 2.0) * cos(pos.z * 3.0 + time * 1.5) * 0.3;
+          wave += snoise(pos * 3.0 + time) * 0.2;
+
+          vec3 darkBlue = vec3(0.0, 0.1, 0.3);
+          vec3 lightBlue = vec3(0.2, 0.6, 1.0);
+          vec3 cyan = vec3(0.4, 0.9, 1.0);
+
+          float waterPattern = (wave + 1.0) * 0.5;
+          color = mix(darkBlue, lightBlue, waterPattern);
+          color = mix(color, cyan, pow(waterPattern, 3.0));
+          color *= intensity;
+
+          float fresnel = pow(1.0 - abs(dot(vNormal, vec3(0.0, 0.0, 1.0))), 2.0);
+          color += fresnel * vec3(0.3, 0.6, 1.0) * 0.5;
+          glow = 0.3 + wave * 0.2;
+        }
+        else if (elementType == 2) {
+          float rockNoise = snoise(pos * 5.0 + time * 0.2);
+          rockNoise += snoise(pos * 10.0) * 0.5;
+
+          vec3 brown = vec3(0.4, 0.25, 0.1);
+          vec3 darkBrown = vec3(0.2, 0.15, 0.05);
+          vec3 green = vec3(0.2, 0.4, 0.1);
+
+          float pattern = (rockNoise + 1.0) * 0.5;
+          color = mix(darkBrown, brown, pattern);
+          color = mix(color, green, smoothstep(0.6, 0.8, pattern) * 0.3);
+          color *= intensity;
+
+          float cracks = step(0.8, abs(rockNoise));
+          color -= cracks * 0.3;
+          glow = 0.1;
+        }
+        else if (elementType == 3) {
+          float swirl = snoise(vec3(pos.x + time, pos.y + sin(time) * 0.5, pos.z + time * 0.7) * 2.0);
+          swirl += snoise(vec3(pos.x - time * 0.5, pos.y, pos.z + time) * 4.0) * 0.5;
+
+          vec3 white = vec3(0.9, 0.95, 1.0);
+          vec3 lightGray = vec3(0.7, 0.75, 0.8);
+          vec3 skyBlue = vec3(0.6, 0.8, 1.0);
+
+          float airPattern = (swirl + 1.0) * 0.5;
+          color = mix(lightGray, white, airPattern);
+          color = mix(color, skyBlue, pow(airPattern, 2.0) * 0.5);
+          color *= intensity;
+
+          alpha = 0.6 + airPattern * 0.3;
+          glow = 0.4 + swirl * 0.2;
+        }
+
+        color += glow * 0.1;
+        gl_FragColor = vec4(color, alpha);
+      }
+    `;
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.z = 3;
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0x0a0a0a, 1);
+      document.body.appendChild(renderer.domElement);
+
+      const geometry = new THREE.SphereGeometry(1, 48, 48);
+      material = new THREE.ShaderMaterial({
+        vertexShader,
+        fragmentShader,
+        uniforms: {
+          time: { value: 0 },
+          intensity: { value: params.intensity },
+          turbulence: { value: params.turbulence },
+          elementType: { value: 0 }
+        },
+        transparent: true,
+        side: THREE.DoubleSide
+      });
+
+      sphere = new THREE.Mesh(geometry, material);
+      scene.add(sphere);
+
+      const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
+      scene.add(ambientLight);
+
+      const pointLight = new THREE.PointLight(0xffffff, 1, 100);
+      pointLight.position.set(5, 5, 5);
+      scene.add(pointLight);
+
+      setupControls();
+      setElement("fire");
+
+      startSimulatedStream();
+      animate();
+    }
+
+    function setupControls() {
+      document.getElementById('intensity').addEventListener('input', (e) => {
+        params.intensity = parseFloat(e.target.value);
+        document.getElementById('intensityVal').textContent = params.intensity.toFixed(1);
+      });
+
+      document.getElementById('speed').addEventListener('input', (e) => {
+        params.speed = parseFloat(e.target.value);
+        document.getElementById('speedVal').textContent = params.speed.toFixed(1);
+      });
+
+      document.getElementById('turbulence').addEventListener('input', (e) => {
+        params.turbulence = parseFloat(e.target.value);
+        document.getElementById('turbulenceVal').textContent = params.turbulence.toFixed(1);
+      });
+    }
+
+    /* =========
+       Mode switching
+       ========= */
+
+    const elementMap = { fire: 0, water: 1, earth: 2, air: 3 };
+    
+
+    function setElement(element) {
+      currentElement = element;
+
+      if (typeof currentState !== "undefined") {
+        currentState = element;
+        pendingState = null;
+        pendingSince = 0;
+        lastCommittedAt = performance.now();
+      }
+
+      const buttons = document.querySelectorAll('.element-btn');
+      buttons.forEach(btn => btn.classList.remove('active'));
+
+      const button = document.querySelector(`.element-btn.${element}`);
+      if (button) button.classList.add('active');
+
+      material.uniforms.elementType.value = elementMap[element];
+
+      const stateEl = document.getElementById("stateVal");
+      if (stateEl) stateEl.textContent = element;
+    }
+
+
+    /* =========
+       Simulated "serial" stream
+       ========= */
+
+    const simUI = {
+      line: document.getElementById("simLine"),
+      dVal: document.getElementById("dVal"),
+      vVal: document.getElementById("vVal")
+    };
+
+    let lastSample = { t: performance.now(), d: 120 };
+    let dSmooth = 120;
+
+    let currentState = "fire";
+    let pendingState = null;
+    let pendingSince = 0;
+    let lastCommittedAt = performance.now();
+
+    const switchControl = {
+      confirmMs: 350,
+      minHoldMs: 900
+    };
+
+    const th = {
+      fireEnter: 28,
+      fireExit: 34,
+      waterEnter: 65,
+      waterExit: 75,
+      airEnterV: 95,
+      airExitV: 70
+    };
+
+    let vSmooth = 0;
+    const vAlpha = 0.2;
+
+    const program = [
+      { pattern: "farSteady" },
+      { pattern: "midSteady" },
+      { pattern: "nearSteady" },
+      { pattern: "fastSweep" }
+    ];
+
+    function parseCsvLine(line) {
+      const parts = line.trim().split(",");
+      if (parts.length < 2) return null;
+
+      const t = Number(parts[0]);
+      const d = Number(parts[1]);
+      if (!Number.isFinite(t) || !Number.isFinite(d)) return null;
+
+      return { t, d };
+    }
+
+    function onNewSensorLine(line) {
+      if (simUI.line) simUI.line.textContent = line.trim();
+
+      const sample = parseCsvLine(line);
+      if (!sample) return;
+
+      const dt = Math.max(0.001, (sample.t - lastSample.t) / 1000);
+      const rawD = sample.d;
+
+      const alpha = 0.10; // light smoothing
+      dSmooth = dSmooth * (1 - alpha) + rawD * alpha;
+
+      const v = (dSmooth - lastSample.d) / dt;
+      vSmooth = vSmooth * (1 - vAlpha) + v * vAlpha;
+
+      lastSample = { t: sample.t, d: dSmooth };
+
+      if (simUI.dVal) simUI.dVal.textContent = dSmooth.toFixed(1);
+      if (simUI.vVal) simUI.vVal.textContent = vSmooth.toFixed(1);
+      decideState(dSmooth, vSmooth);
+    }
+
+    function decideState(dCm, vCms) {
+      const now = performance.now();
+      const absV = Math.abs(vCms);
+
+      // Use hysteresis based classification
+      const candidate = classifyWithHysteresis(dCm, absV);
+
+      // Already in that state
+      if (candidate === currentState) {
+        pendingState = null;
+        pendingSince = 0;
+        return;
+      }
+
+      // Enforce minimum hold time
+      const heldFor = now - lastCommittedAt;
+      if (heldFor < switchControl.minHoldMs) {
+        return;
+      }
+
+      // Start or reset pending
+      if (pendingState !== candidate) {
+        pendingState = candidate;
+        pendingSince = now;
+        return;
+      }
+
+      // Confirm pending
+      const pendingFor = now - pendingSince;
+      if (pendingFor >= switchControl.confirmMs) {
+        currentState = candidate;
+        lastCommittedAt = now;
+        pendingState = null;
+        pendingSince = 0;
+        setElement(currentState);
+      }
+    }
+
+
+    function classifyWithHysteresis(dCm, absV) {
+      // Air based on velocity
+      if (currentState === "air") {
+        if (absV >= th.airExitV) return "air";
+      } else {
+        if (absV >= th.airEnterV) return "air";
+      }
+
+      // Fire
+      if (currentState === "fire") {
+        if (dCm <= th.fireExit) return "fire";
+      } else {
+        if (dCm <= th.fireEnter) return "fire";
+      }
+
+      // Water
+      if (currentState === "water") {
+        if (dCm <= th.waterExit) return "water";
+      } else {
+        if (dCm <= th.waterEnter) return "water";
+      }
+
+      return "earth";
+    }
+
+
+    function startSimulatedStream() {
+      const sampleHz = 20;
+      const intervalMs = Math.round(1000 / sampleHz);
+
+      const segmentMs = 4500;
+
+      let segIndex = 0;
+      let segStart = performance.now();
+      
+
+      function currentSegment(now) {
+        const elapsed = now - segStart;
+        if (elapsed >= segmentMs) {
+          segIndex = (segIndex + 1) % program.length;
+          segStart = now;
+        }
+        return program[segIndex];
+      }
+
+      function randn() {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      }
+
+      function synthDistance(now, seg) {
+        const t = (now - segStart) / 1000;
+        const noise = randn() * 1.2;
+
+        if (seg.pattern === "nearSteady") return 22 + Math.sin(t * 2.0) * 1.5 + noise;
+        if (seg.pattern === "midSteady")  return 55 + Math.sin(t * 1.4) * 3.0 + noise;
+        if (seg.pattern === "farSteady")  return 110 + Math.sin(t * 0.9) * 2.0 + noise;
+
+        // fastSweep: triangle wave from ~20 to ~120 cm in ~0.7s
+        const period = 0.7;
+        const phase = (t % period) / period;
+        const tri = phase < 0.5 ? phase * 2 : (1 - phase) * 2;
+        return (120 - tri * 100) + noise;
+      }
+
+      setInterval(() => {
+        const now = performance.now();
+        const seg = currentSegment(now);
+        const d = synthDistance(now, seg);
+
+        const clamped = Math.max(2, Math.min(250, d));
+        const line = `${Math.round(now)},${clamped.toFixed(1)}`;
+
+        onNewSensorLine(line);
+      }, intervalMs);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      time += 0.01 * params.speed;
+      material.uniforms.time.value = time;
+      material.uniforms.intensity.value = params.intensity;
+      material.uniforms.turbulence.value = params.turbulence;
+
+      sphere.rotation.y += 0.003;
+      sphere.rotation.x += 0.001;
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    init();
+  </script>
+</body>
+</html>
+
+ -->
+
+
+<!-- 
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Omnibending - Evolved</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #050505; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    canvas { display: block; }
+    #ui {
+      position: absolute; top: 20px; left: 20px;
+      background: rgba(0, 0, 0, 0.7); padding: 20px;
+      border-radius: 15px; color: #fff; min-width: 250px;
+      backdrop-filter: blur(15px); border: 1px solid rgba(255,255,255,0.1);
+      z-index: 100;
+    }
+    .element-btn {
+      padding: 10px; margin: 5px; border: none; border-radius: 8px;
+      cursor: pointer; font-weight: bold; transition: 0.3s; opacity: 0.5;
+    }
+    .element-btn.active { opacity: 1; transform: scale(1.1); box-shadow: 0 0 15px currentColor; }
+    .fire { background: #ff4500; color: #fff; }
+    .water { background: #1e90ff; color: #fff; }
+    .earth { background: #8b4513; color: #fff; }
+    .air { background: #87ceeb; color: #333; }
+    .mono { font-family: monospace; color: #00ffcc; }
+    #simBox { margin-top: 15px; font-size: 11px; border-top: 1px solid #444; pt: 10px; }
+  </style>
+</head>
+<body>
+
+<div id="ui">
+    <h2 style="margin-top:0">Elemental Core</h2>
+    <div id="buttons">
+      <button class="element-btn fire active" onclick="setElement('fire')">Fire</button>
+      <button class="element-btn water" onclick="setElement('water')">Water</button>
+      <button class="element-btn earth" onclick="setElement('earth')">Earth</button>
+      <button class="element-btn air" onclick="setElement('air')">Air</button>
+    </div>
+    <div id="simBox">
+        <p>Sensor Distance: <span class="mono" id="dVal">0</span> cm</p>
+        <p>Velocity: <span class="mono" id="vVal">0</span> cm/s</p>
+        <p>Active: <span class="mono" id="stateVal">fire</span></p>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<script id="vertexShader" type="x-shader/x-vertex">
+  uniform float uTime;
+  uniform float uIntensity;
+  uniform float uTurbulence;
+  varying vec2 vUv;
+  varying vec3 vNormal;
+  varying float vNoise;
+
+  // Classic 3D Noise by Stefan Gustavson
+  vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+  vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+  vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+  float snoise(vec3 v) {
+    const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+    const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+    vec3 i  = floor(v + dot(v, C.yyy));
+    vec3 x0 = v - i + dot(i, C.xxx);
+    vec3 g = step(x0.yzx, x0.xyz);
+    vec3 l = 1.0 - g;
+    vec3 i1 = min(g.xyz, l.zxy);
+    vec3 i2 = max(g.xyz, l.zxy);
+    vec3 x1 = x0 - i1 + C.xxx;
+    vec3 x2 = x0 - i2 + C.yyy;
+    vec3 x3 = x0 - D.yyy;
+    i = mod289(i);
+    vec4 p = permute(permute(permute(i.z + vec4(0.0, i1.z, i2.z, 1.0))+ i.y + vec4(0.0, i1.y, i2.y, 1.0))+ i.x + vec4(0.0, i1.x, i2.x, 1.0));
+    float n_ = 0.142857142857;
+    vec3 ns = n_ * D.wyz - D.xzx;
+    vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+    vec4 x_ = floor(j * ns.z);
+    vec4 y_ = floor(j - 7.0 * x_);
+    vec4 x = x_ *ns.x + ns.yyyy;
+    vec4 y = y_ *ns.x + ns.yyyy;
+    vec4 h = 1.0 - abs(x) - abs(y);
+    vec4 b0 = vec4(x.xy, y.xy);
+    vec4 b1 = vec4(x.zw, y.zw);
+    vec4 s0 = floor(b0)*2.0 + 1.0;
+    vec4 s1 = floor(b1)*2.0 + 1.0;
+    vec4 sh = -step(h, vec4(0.0));
+    vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+    vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+    vec3 p0 = vec3(a0.xy, h.x);
+    vec3 p1 = vec3(a0.zw, h.y);
+    vec3 p2 = vec3(a1.xy, h.z);
+    vec3 p3 = vec3(a1.zw, h.w);
+    vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+    vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+  }
+
+  void main() {
+    vUv = uv;
+    vNormal = normalize(normalMatrix * normal);
+    
+    // APPROACH 1: VERTEX DISPLACEMENT
+    // Displacement based on noise
+    float noise = snoise(vec3(position * uTurbulence + uTime * 0.5));
+    vNoise = noise;
+    
+    // Push vertices along normals
+    float displacement = noise * 0.2 * uIntensity;
+    vec3 newPosition = position + normal * displacement;
+    
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(newPosition, 1.0);
+  }
+</script>
+
+<script id="fragmentShader" type="x-shader/x-fragment">
+  uniform float uTime;
+  uniform int uType;
+  varying vec3 vNormal;
+  varying float vNoise;
+
+  void main() {
+    vec3 color = vec3(0.0);
+    float glow = pow(0.7 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
+    
+    if(uType == 0) { // FIRE
+        color = mix(vec3(1.0, 0.2, 0.0), vec3(1.0, 0.8, 0.0), vNoise + 0.5);
+    } else if(uType == 1) { // WATER
+        color = mix(vec3(0.0, 0.2, 1.0), vec3(0.4, 0.9, 1.0), vNoise + 0.5);
+    } else if(uType == 2) { // EARTH
+        color = mix(vec3(0.2, 0.1, 0.0), vec3(0.4, 0.7, 0.2), vNoise + 0.2);
+    } else { // AIR
+        color = vec3(0.8, 0.9, 1.0);
+    }
+
+    // Add visual "punch" - Faking Bloom/Inner Glow
+    gl_FragColor = vec4(color + (glow * 0.5), 0.9);
+  }
+</script>
+
+<script>
+    let scene, camera, renderer, sphere, particles, material;
+    let clock = new THREE.Clock();
+    let currentElement = 'fire';
+    
+    // Parameters for sensor simulation
+    let dSmooth = 120, vSmooth = 0;
+
+    function init() {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 4;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // MAIN SPHERE (Vertex Displacement)
+        const geometry = new THREE.IcosahedronGeometry(1.2, 64); // High poly for smooth displacement
+        material = new THREE.ShaderMaterial({
+            vertexShader: document.getElementById('vertexShader').textContent,
+            fragmentShader: document.getElementById('fragmentShader').textContent,
+            uniforms: {
+                uTime: { value: 0 },
+                uIntensity: { value: 1.0 },
+                uTurbulence: { value: 1.5 },
+                uType: { value: 0 }
+            },
+            transparent: true
+        });
+        sphere = new THREE.Mesh(geometry, material);
+        scene.add(sphere);
+
+        // APPROACH 2: PARTICLE SYSTEM
+        const pCount = 2000;
+        const pGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(pCount * 3);
+        for (let i = 0; i < pCount * 3; i++) {
+            positions[i] = (Math.random() - 0.5) * 10;
+        }
+        pGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const pMaterial = new THREE.PointsMaterial({
+            size: 0.05,
+            transparent: true,
+            opacity: 0.6,
+            blending: THREE.AdditiveBlending,
+            color: 0xff4500
+        });
+        particles = new THREE.Points(pGeometry, pMaterial);
+        scene.add(particles);
+
+        startSimulatedStream();
+        animate();
+    }
+
+    function setElement(type) {
+        currentElement = type;
+        const map = { fire: 0, water: 1, earth: 2, air: 3 };
+        const colors = { fire: 0xff4500, water: 0x00aaff, earth: 0x88cc44, air: 0xffffff };
+        
+        material.uniforms.uType.value = map[type];
+        particles.material.color.setHex(colors[type]);
+        
+        // UI Updates
+        document.querySelectorAll('.element-btn').forEach(btn => btn.classList.remove('active'));
+        document.querySelector('.' + type).classList.add('active');
+        document.getElementById('stateVal').textContent = type;
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        let delta = clock.getDelta();
+        let time = clock.getElapsedTime();
+
+        material.uniforms.uTime.value = time;
+        
+        // Rotate Sphere
+        sphere.rotation.y += 0.2 * delta;
+        
+        // Animate Particles (Vortex effect)
+        const positions = particles.geometry.attributes.position.array;
+        for (let i = 0; i < positions.length; i += 3) {
+            // Air spinning faster
+            let speed = currentElement === 'air' ? 4 : 1;
+            let x = positions[i];
+            let z = positions[i+2];
+            
+            // Basic Orbit
+            positions[i] = x * Math.cos(0.1 * speed * delta) - z * Math.sin(0.1 * speed * delta);
+            positions[i+2] = x * Math.sin(0.1 * speed * delta) + z * Math.cos(0.1 * speed * delta);
+            
+            // Fire rises
+            if(currentElement === 'fire') {
+                positions[i+1] += 0.02;
+                if(positions[i+1] > 3) positions[i+1] = -3;
+            }
+        }
+        particles.geometry.attributes.position.needsUpdate = true;
+
+        renderer.render(scene, camera);
+    }
+
+    // Logic for sensor loop (inherited from your original script)
+    function startSimulatedStream() {
+        setInterval(() => {
+            const now = Date.now();
+            // Simulate distance cycling 20cm to 120cm
+            let d = 70 + Math.sin(now * 0.001) * 50;
+            dSmooth = d;
+            
+            document.getElementById('dVal').textContent = dSmooth.toFixed(1);
+            
+            // Simple logic switch
+            if (dSmooth < 35) { if(currentElement !== 'fire') setElement('fire'); }
+            else if (dSmooth < 70) { if(currentElement !== 'water') setElement('water'); }
+            else if (dSmooth < 100) { if(currentElement !== 'earth') setElement('earth'); }
+            else { if(currentElement !== 'air') setElement('air'); }
+            
+        }, 50);
+    }
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    init();
+</script>
+</body>
+</html>
+  -->
+
+
+
+
+
+
